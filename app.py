@@ -69,6 +69,10 @@ def load_artifacts(disease):
         with open(hub_probes_path) as f:
             hub_probes = json.load(f)
         
+        # Ensure hub_probes is a list
+        if isinstance(hub_probes, dict):
+            hub_probes = list(hub_probes.keys())
+        
         # Load models
         models = {}
         for pkl in base.glob(f"*{suffix}"):
@@ -87,10 +91,12 @@ def load_artifacts(disease):
 def validate_data(df, hub_probes):
     """Validate uploaded data"""
     issues = []
+    warnings = []
     
     # Check if dataframe is empty
     if df.empty:
-        issues.append("Uploaded file is empty")
+        issues.append("❌ Uploaded file is empty")
+        return issues, warnings
     
     # Check for required columns
     available_genes = set(df.columns)
@@ -98,14 +104,22 @@ def validate_data(df, hub_probes):
     missing_genes = required_genes - available_genes
     
     if missing_genes:
-        issues.append(f"Missing {len(missing_genes)} hub genes (will be filled with 0)")
+        warnings.append(f"⚠️ Missing {len(missing_genes)} hub genes (will be filled with 0)")
     
-    return issues
+    # Check for duplicate columns
+    if len(df.columns) != len(set(df.columns)):
+        issues.append("❌ Duplicate column names detected")
+    
+    # Check for NaN values
+    if df.isnull().any().any():
+        warnings.append(f"⚠️ Found NaN values in data (will be filled with 0)")
+    
+    return issues, warnings
 
 def prepare_data(df, hub_probes):
-    """Prepare data for prediction"""
-    # Convert column names to string
-    df.columns = df.columns.map(str)
+    """Prepare data for prediction with strict column ordering"""
+    # Convert column names to string and strip whitespace
+    df.columns = df.columns.map(str).str.strip()
     
     # Identify and store metadata columns
     metadata_cols = ["SampleID", "Sample_Description", "Label"]
@@ -117,13 +131,22 @@ def prepare_data(df, hub_probes):
     # Drop metadata columns
     df_genes = df.drop(columns=[c for c in metadata_cols if c in df.columns], errors='ignore')
     
-    # Ensure all hub probes are present
+    # Create dataframe with EXACT hub probe ordering
+    X = pd.DataFrame(index=df_genes.index)
     for gene in hub_probes:
-        if gene not in df_genes.columns:
-            df_genes[gene] = 0.0
+        if gene in df_genes.columns:
+            X[gene] = df_genes[gene]
+        else:
+            X[gene] = 0.0
     
-    # Select only hub probes in correct order
-    X = df_genes[hub_probes]
+    # Fill any remaining NaN values with 0
+    X = X.fillna(0.0)
+    
+    # Ensure correct data type
+    X = X.astype(float)
+    
+    # Verify column order matches hub_probes exactly
+    assert list(X.columns) == list(hub_probes), "Column order mismatch!"
     
     return X, metadata
 
@@ -238,7 +261,7 @@ def main():
             **Optional Columns:**
             - SampleID
             - Sample_Description
-            - Label (for validation)
+            - Label (for validation, must be 0 or 1)
             
             Missing hub genes will be filled with 0.
             """)
@@ -289,8 +312,8 @@ def main():
     with st.expander("🧬 View Hub Genes"):
         st.markdown(f"**Total Hub Genes:** {len(hub_probes)}")
         hub_df = pd.DataFrame({
-            "Gene ID": hub_probes,
-            "Index": range(1, len(hub_probes) + 1)
+            "Index": range(1, len(hub_probes) + 1),
+            "Gene ID": hub_probes
         })
         st.dataframe(hub_df, use_container_width=True, hide_index=True)
     
@@ -306,26 +329,42 @@ def main():
                 df = pd.read_csv(uploaded)
                 
                 # Validate data
-                issues = validate_data(df, hub_probes)
+                issues, warnings = validate_data(df, hub_probes)
+                
                 if issues:
+                    st.error("❌ Critical Issues Found:")
+                    for issue in issues:
+                        st.error(issue)
+                    return
+                
+                if warnings:
                     with st.expander("⚠️ Data Validation Warnings", expanded=True):
-                        for issue in issues:
-                            st.warning(issue)
+                        for warning in warnings:
+                            st.warning(warning)
                 
                 # Prepare data
                 X, metadata = prepare_data(df, hub_probes)
                 
                 st.success(f"✅ Successfully loaded {len(X)} samples with {len(hub_probes)} hub genes")
+                
+                # Display data shape for verification
+                st.info(f"📐 Data Shape: {X.shape[0]} samples × {X.shape[1]} features")
             
             # Make predictions
             with st.spinner("Making predictions..."):
                 # Get probabilities
                 if hasattr(model, "predict_proba"):
-                    probs = model.predict_proba(X)[:, 1]
+                    probs_raw = model.predict_proba(X)
+                    # Ensure we get the probability for class 1 (positive class)
+                    if probs_raw.shape[1] == 2:
+                        probs = probs_raw[:, 1]
+                    else:
+                        probs = probs_raw[:, 0]
                 elif hasattr(model, "decision_function"):
-                    # Normalize decision function to [0, 1]
+                    # Use decision function and normalize
                     scores = model.decision_function(X)
-                    probs = (scores - scores.min()) / (scores.max() - scores.min())
+                    # Sigmoid transformation for better probability estimation
+                    probs = 1 / (1 + np.exp(-scores))
                 else:
                     st.error("Model does not support probability prediction")
                     return
@@ -343,23 +382,32 @@ def main():
                 
                 # Add metadata if available
                 for col, values in metadata.items():
-                    results[col] = values.values
+                    if col == "Label":
+                        # Ensure labels are integers
+                        results[col] = values.astype(int).values
+                    else:
+                        results[col] = values.values
             
             # Display summary metrics
             st.subheader("Summary Statistics")
             col1, col2, col3, col4 = st.columns(4)
             
+            positive_count = int((results['Prediction'] == 1).sum())
+            negative_count = int((results['Prediction'] == 0).sum())
+            avg_prob = float(results['Probability'].mean())
+            
             with col1:
                 st.metric("Total Samples", len(results))
             with col2:
-                positive_count = (results['Prediction'] == 1).sum()
                 st.metric("Positive Cases", positive_count)
             with col3:
-                negative_count = (results['Prediction'] == 0).sum()
                 st.metric("Negative Cases", negative_count)
             with col4:
-                avg_prob = results['Probability'].mean()
                 st.metric("Avg. Probability", f"{avg_prob:.3f}")
+            
+            # Verification check
+            if positive_count + negative_count != len(results):
+                st.error(f"⚠️ Classification count mismatch! Positive: {positive_count}, Negative: {negative_count}, Total: {len(results)}")
             
             # Visualizations
             st.subheader("Visualizations")
@@ -411,6 +459,8 @@ def main():
                         mime="text/csv",
                         use_container_width=True
                     )
+                else:
+                    st.info("No positive cases to download")
             
             with col3:
                 high_risk = results[results['Probability'] >= 0.7]
@@ -423,73 +473,87 @@ def main():
                         mime="text/csv",
                         use_container_width=True
                     )
+                else:
+                    st.info("No high-risk cases to download")
             
             # Model performance (if labels are available)
-            if 'Label' in metadata:
+            if 'Label' in metadata and 'Label' in results.columns:
                 st.divider()
                 st.subheader("📈 Model Performance")
                 
                 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score, roc_curve
                 
-                y_true = metadata['Label'].values
+                y_true = results['Label'].values.astype(int)
+                y_pred = results['Prediction'].values.astype(int)
+                y_prob = results['Probability'].values
                 
-                # Calculate metrics
-                accuracy = accuracy_score(y_true, preds)
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Accuracy", f"{accuracy:.4f}")
-                with col2:
-                    if len(np.unique(y_true)) > 1:
-                        auc = roc_auc_score(y_true, probs)
-                        st.metric("AUC-ROC", f"{auc:.4f}")
-                with col3:
-                    sensitivity = (preds[y_true == 1] == 1).sum() / (y_true == 1).sum()
-                    st.metric("Sensitivity", f"{sensitivity:.4f}")
-                
-                # Confusion matrix
-                col1, col2 = st.columns(2)
-                with col1:
-                    cm = confusion_matrix(y_true, preds)
-                    fig_cm = px.imshow(
-                        cm,
-                        labels=dict(x="Predicted", y="Actual", color="Count"),
-                        x=["Negative", "Positive"],
-                        y=["Negative", "Positive"],
-                        text_auto=True,
-                        color_continuous_scale='Blues'
-                    )
-                    fig_cm.update_layout(title="Confusion Matrix")
-                    st.plotly_chart(fig_cm, use_container_width=True)
-                
-                with col2:
-                    if len(np.unique(y_true)) > 1:
-                        fpr, tpr, _ = roc_curve(y_true, probs)
-                        fig_roc = go.Figure()
-                        fig_roc.add_trace(go.Scatter(
-                            x=fpr, y=tpr,
-                            mode='lines',
-                            name=f'ROC Curve (AUC={auc:.3f})',
-                            line=dict(color='blue', width=2)
-                        ))
-                        fig_roc.add_trace(go.Scatter(
-                            x=[0, 1], y=[0, 1],
-                            mode='lines',
-                            name='Random',
-                            line=dict(color='red', dash='dash')
-                        ))
-                        fig_roc.update_layout(
-                            title="ROC Curve",
-                            xaxis_title="False Positive Rate",
-                            yaxis_title="True Positive Rate"
+                # Verify label validity
+                unique_labels = np.unique(y_true)
+                if not all(label in [0, 1] for label in unique_labels):
+                    st.error("⚠️ Labels must be 0 or 1")
+                else:
+                    # Calculate metrics
+                    accuracy = accuracy_score(y_true, y_pred)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Accuracy", f"{accuracy:.4f}")
+                    with col2:
+                        if len(unique_labels) > 1:
+                            auc = roc_auc_score(y_true, y_prob)
+                            st.metric("AUC-ROC", f"{auc:.4f}")
+                        else:
+                            st.metric("AUC-ROC", "N/A (single class)")
+                    with col3:
+                        if (y_true == 1).sum() > 0:
+                            sensitivity = (y_pred[y_true == 1] == 1).sum() / (y_true == 1).sum()
+                            st.metric("Sensitivity", f"{sensitivity:.4f}")
+                        else:
+                            st.metric("Sensitivity", "N/A (no positives)")
+                    
+                    # Confusion matrix
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        cm = confusion_matrix(y_true, y_pred)
+                        fig_cm = px.imshow(
+                            cm,
+                            labels=dict(x="Predicted", y="Actual", color="Count"),
+                            x=["Negative", "Positive"],
+                            y=["Negative", "Positive"],
+                            text_auto=True,
+                            color_continuous_scale='Blues'
                         )
-                        st.plotly_chart(fig_roc, use_container_width=True)
-                
-                # Classification report
-                with st.expander("📋 Detailed Classification Report"):
-                    report = classification_report(y_true, preds, output_dict=True)
-                    report_df = pd.DataFrame(report).transpose()
-                    st.dataframe(report_df, use_container_width=True)
+                        fig_cm.update_layout(title="Confusion Matrix")
+                        st.plotly_chart(fig_cm, use_container_width=True)
+                    
+                    with col2:
+                        if len(unique_labels) > 1:
+                            fpr, tpr, _ = roc_curve(y_true, y_prob)
+                            fig_roc = go.Figure()
+                            fig_roc.add_trace(go.Scatter(
+                                x=fpr, y=tpr,
+                                mode='lines',
+                                name=f'ROC Curve (AUC={auc:.3f})',
+                                line=dict(color='blue', width=2)
+                            ))
+                            fig_roc.add_trace(go.Scatter(
+                                x=[0, 1], y=[0, 1],
+                                mode='lines',
+                                name='Random',
+                                line=dict(color='red', dash='dash')
+                            ))
+                            fig_roc.update_layout(
+                                title="ROC Curve",
+                                xaxis_title="False Positive Rate",
+                                yaxis_title="True Positive Rate"
+                            )
+                            st.plotly_chart(fig_roc, use_container_width=True)
+                    
+                    # Classification report
+                    with st.expander("📋 Detailed Classification Report"):
+                        report = classification_report(y_true, y_pred, output_dict=True)
+                        report_df = pd.DataFrame(report).transpose()
+                        st.dataframe(report_df, use_container_width=True)
         
         except Exception as e:
             st.error(f"❌ Error processing data: {str(e)}")
@@ -525,7 +589,7 @@ def main():
         - Cross-disease molecular mechanisms
         """)
 
-# Footer
+    # Footer
     st.divider()
     st.markdown("""
         <div style='text-align: center; color: #666; padding: 1rem;'>
